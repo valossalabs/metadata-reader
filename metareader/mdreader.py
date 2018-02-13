@@ -145,11 +145,17 @@ class MetadataReader(object):
             return min_n, max_n
 
         space = 0.05
-        sub_data_gen = self.get_subtitle_data(
+        sub_data_gen = self.get_all_occs(
             start=kwargs.get("start_second"),
             stop=kwargs.get("end_second"),
             det_type=kwargs.get("detection_types"),
         )
+        if kwargs.get("detection_types") == "audio.speech":
+            # Assume that this can be outputted as it is.
+            for start, stop, label in sub_data_gen:
+                yield [start, stop, label]
+            return
+
         last_end_time = -space
         subtitle_labels = []
         for start, stop, label in sub_data_gen:
@@ -463,46 +469,43 @@ class MetadataReader(object):
                     continue
                 yield sec_index, detdata
 
-    def get_subtitle_data(self, start=0, stop=None, det_type=None):
-        """Yields data needed for subtitle generation
+    def get_all_occs(self, start=0, stop=None, det_type=None):
+        """Generator which yields each occ ordered by starting time.
 
-        Format: [start, stop, label/name]
-        """
-        for secdata in self.get_all_occs_by_second_data(start, stop, det_type):
-            detection = self.metadata[u"detections"][secdata[u"d"]]
-            # Get start and stop times for detection:
-            for occ in detection[u"occs"]:  # Find the occ
-                if occ[u"id"] == secdata[u"o"][0]:
-                    start = occ[u"ss"]
-                    stop = occ[u"se"]
+        :param start: Define starting time
+        :type start: int | float
+        :param stop: Stop when this time is reached.
+        :type stop: int | float | None
+        :param det_type: Choose specific detection type with this parameter.
+        :type det_type: str |None
+        :return: (start_time, stop_time, label)
+        :rtype: Generator[tuple]"""
+        if stop is None:
+            # Make sure that stop is bigger than index
+            stop = float('inf')
+        labels = list()
+        for id, detection in self.metadata["detections"].iteritems():
+            if det_type and detection["t"] not in det_type:
+                continue
+            if "occs" not in detection:
+                continue
             # Generate label:
-            if "a" in detection:
-                if "similar_to" in detection["a"]:
-                    label = detection["a"]["similar_to"][0]["name"]
-                elif "gender" in detection["a"]:
-                    label = "unknown {}".format(detection["a"]["gender"]["value"])
-                else:
-                    label = "unknown person"
-
+            if "a" in detection and "similar_to" in detection["a"]:
+                label = detection["a"]["similar_to"][0]["name"]
+            elif "a" in detection and "gender" in detection["a"]:
+                label = "unknown {} ({})".format(detection["a"]["gender"]["value"], id)
             elif "label" in detection:
                 label = detection["label"]
             else:
                 raise RuntimeError("No 'a' or 'label' in detection")
-            yield [start, stop, label]
-
-    def get_all_occs_by_second_data(self, start=0, stop=None, det_type=None):
-        """yields every second of metadata unless limited"""
-        if stop is None:
-            # Make sure that stop is bigger than index
-            stop = float('inf')
-        index = start
-        for second in self.metadata["detection_groupings"]["by_second"][start:]:
-            if index > stop:
-                break
-            for secdata in second:
-                if det_type and self.metadata["detections"][secdata["d"]]["t"] not in det_type:
-                    continue
-                yield secdata
+            for occ in detection["occs"]:
+                labels.append((occ["ss"], occ["se"], label))
+        for item in sorted(labels, key=lambda x: x[0]):
+            if item[0]<start:
+                continue
+            if item[0]>stop:
+                break  # items are sorted by start_time so it's safe to break here.
+            yield item
 
 
 def _detection_type_specific_information(detection):
