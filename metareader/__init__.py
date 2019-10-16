@@ -6,7 +6,10 @@ package is split into three parts, mdreader, mdprinter and mdplotter.
 - mdplotter contains all methods to plot data gotten from mdreader.
 """
 
-
-import mdreader
-import mdplotter
-import mdprinter
+#import metareader.mdreader as reader
+#try:
+#    import metareader.mdplotter as plotter
+#except ImportError as e:
+#    pass
+#import metareader.mdprinter as printer
+#from . import mdreader

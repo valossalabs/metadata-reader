@@ -3,9 +3,17 @@
 
 This module contains all functions, classes etc. to read Valossa Core metadata.
 """
+from __future__ import print_function, unicode_literals
+from __future__ import absolute_import
+from __future__ import division
 
-import sys
 from decimal import Decimal  # Division by 20 causes rounding behaviour, which isn't pretty.
+from collections import OrderedDict
+
+import logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+from .lib.mdutil import CoreMetadata, LengthSum
 
 
 class AppError(Exception):
@@ -13,14 +21,21 @@ class AppError(Exception):
 
 
 class MetadataReader(object):
-    def __init__(self, metadata_json):
-        self.metadata = metadata_json
+    """Contains various methods for core_metadata parsing."""
+
+    def __init__(self, core_metadata, blacklist=None):
+        """Each instance is about a specific core_metadata.
+
+        :param dict core_metadata: Loaded core_metadata.
+        """
+        # blacklist isn't actually being used yet.
+        self.metadata = core_metadata
+        self.core_metadata = CoreMetadata(self.metadata, blacklist=blacklist)
 
     def list_detections(self, **kwargs):
-        """Yields csv-format list rows.
+        """Generator which yields OrderedDict for each detection.
 
-        First row is the csv header containing following labels:
-
+        OrderedDict keys:
         * detection ID
         * detection type
         * label
@@ -29,36 +44,49 @@ class MetadataReader(object):
         * more information
 
 
-        :param kwargs: Arguments are just passed forward here.
+        :param kwargs: Keyword arguments are just passed forward here. Those are
+                       mainly used for filtering unwanted detections out.
         :return: Generator which yields one row at time.
-        :rtype: Generator[list]
+        :rtype: Generator[collections.OrderedDict]
         """
-
-        yield ["detection ID", "detection type", "label", "Valossa concept ID", "GKG concept ID", "more information"]
-        for det_id, detection in self._get_all_detections(**kwargs):
-
+        extras = set()
+        if kwargs["detection_persons"] is not None:
+            extras.add("similar_to")
+        if kwargs["extra_header"] is not None:
+            extras |= set(kwargs["extra_header"])
+        for det_id, detection in self.core_metadata.detections(
+            n_per_type=kwargs["n_most_prominent_detections_per_type"],
+            categories=kwargs["category"],
+            detection_types=kwargs["detection_types"],
+            sort_by=kwargs["sort_by"],
+        ):
             # Limit listing:
             if not _conditions_match(detection, **kwargs):
                 continue
-
             vco_id = ""
             if "cid" in detection:
                 vco_id = detection["cid"]
             gkg_id = ""
             if "ext_refs" in detection and "gkg" in detection["ext_refs"]:
                 gkg_id = detection["ext_refs"]["gkg"]["id"]
-            more_info = _detection_type_specific_information(detection)
 
-            yield [det_id,                 # Detection ID
-                   detection["t"],         # Detection type
-                   detection["label"],     # Label
-                   vco_id,                 # Valossa Concept ID
-                   gkg_id,                 # GKG Concept ID
-                   more_info,              # More information
-                   ]
+            # more_info = _detection_type_specific_information(detection)
+            d = OrderedDict([
+                ("detection ID",       det_id),
+                ("detection type",       detection["t"]),
+                ("label",              detection["label"]),
+                ("Valossa concept ID", vco_id),
+                ("GKG concept ID",     gkg_id),
+                # ("more information",   more_info),
+            ])
+            if "similar_to" in extras:
+                d["similar to"] = _person_name(detection=detection) if detection["t"] == "human.face" else ""
+            if "gender" in extras:
+                d["gender"] = _person_gender(detection=detection) if detection["t"] == "human.face" else ""
+            yield d
 
     def list_detections_by_second(self, **kwargs):
-        """List detections by second
+        """Generator which yields detections for each second as OrderedDict.
 
         Output headers (default):
 
@@ -72,6 +100,13 @@ class MetadataReader(object):
         * GKG concept ID
         * more information
 
+        Output headers (short):
+
+        * timestamp
+        * label
+        * label
+        ...
+
         Output headers (srt):
 
         * start
@@ -81,29 +116,42 @@ class MetadataReader(object):
 
         :param kwargs: Keyword arguments used here:
             - 'output_format' (str). If 'srt, use self.list_subtitle() -generator.
+            - 'short' (bool). If True, use self.list_short() -generator.
+            - 'valence' (bool). If True, use self.list_sentiment() -generator.
             - 'min_confidence' (float). Valossa Core metadata has confidence values between 0.5 and 1.0 so we encourage
               to use values between those in this argument, or None.
         :return: Generator which yields one row at time.
-        :rtype: Generator[list]
+        :rtype: Generator[collections.OrderedDict]
         """
+        extras = set()
+        if kwargs["detection_persons"] is not None:
+            extras.add("similar_to")
+        if kwargs["extra_header"] is not None:
+            extras |= set(kwargs["extra_header"])
 
         if kwargs.get("output_format") == "srt":
             # Output subtitles
             for item in self.list_subtitle(**kwargs):
                 yield item
+        elif kwargs.get("short", False):
+            # Shorter form
+            for item in self.list_short(**kwargs):
+                yield item
+        elif kwargs.get("sentiment", False):
+            # Sentiment (not emotions)
+            for item in self.list_sentiment(**kwargs):
+                yield item
         else:
             # Default procedure
-            yield ["second", "timestamp", "detection ID", "detection type", "confidence", "label", "Valossa concept ID",
-                   "GKG concept ID", "more information"]
             for sec_index, detdata in self._detections_by_second(**kwargs):
                 detection_id = detdata["d"]
                 detection = self.metadata["detections"][detection_id]
-                vco_id = ""
-                if "cid" in detection:
-                    vco_id = detection["cid"]
-                gkg_id = ""
+                vco_id = detection.get("cid", "")
                 if "ext_refs" in detection and "gkg" in detection["ext_refs"]:
                     gkg_id = detection["ext_refs"]["gkg"]["id"]
+                else:
+                    gkg_id = ""
+
                 confidence = ""
                 if "c" in detdata:
                     # TESTING FOR ARGS.MIN_CONFIDENCE
@@ -111,19 +159,179 @@ class MetadataReader(object):
                         continue
                     confidence = detdata["c"]
 
-                more_info = _detection_type_specific_information(detection)
-                yield [sec_index,                                       # Second-index
-                       _seconds_to_timestamp_hhmmss(sec_index),         # Timestamp
-                       detection_id,                                    # Detection ID
-                       detection["t"],                                  # Detection type
-                       confidence,                                      # Confidence
-                       unicode(detection["label"]).encode("utf-8"),     # Label
-                       vco_id,                                          # Valossa Concept ID
-                       gkg_id,                                          # GKG Concept ID
-                       unicode(more_info).encode("utf-8")]              # More information
+                # more_info = _detection_type_specific_information(detection)
+                d = OrderedDict([
+                    ("second",             sec_index),
+                    ("timestamp",          _seconds_to_timestamp_hhmmss(sec_index)),
+                    ("detection ID",       detection_id),
+                    ("detection type",     detection["t"]),
+                    ("confidence",         confidence),
+                    ("label",              detection["label"]),
+                    ("Valossa concept ID", vco_id),
+                    ("GKG concept ID",     gkg_id),
+                    # ("more information",   more_info),
+                ])
+                if "valence" in extras:
+                    d["valence from -1.0 to 1.0"] = detdata["a"]["sen"]["val"] \
+                        if "a" in detdata and "sen" in detdata["a"] and "val" in detdata["a"]["sen"] else ""
+                if "similar_to" in extras:
+                    d["similar to"] = _person_name(detection=detection) if detection["t"] == "human.face" else ""
+                if "gender" in extras:
+                    d["gender"] = _person_gender(detection=detection) if detection["t"] == "human.face" else ""
+                yield d
+
+    def list_sentiment(self, **kwargs):
+        """Generator which yields sentiment data by second from metadata.
+
+        Output headers:
+
+        second,
+        timestamp,
+        speech valence,
+        face valence (1),
+        face valence (2),
+        ...
+
+
+        :param kwargs: Arguments used here:
+            - 'start_second' (int). In order to have correct index.
+        :return: Generator which yields one row at time.
+        :rtype: Generator[collections.OrderedDict]
+        """
+        # First pass: add all persons to list.
+        sentiment_person_ids = []
+        for index, data in self._detections_by_second(**kwargs):
+            if "a" in data and "sen" in data["a"]:
+                if data["d"] not in sentiment_person_ids:
+                    sentiment_person_ids.append(data["d"])
+
+        # Sort persons at prominence order:
+        sentiment_person_ids.sort(
+            key=lambda x: self.metadata["detection_groupings"]["by_detection_type"]["human.face"].index(x))
+        speech_sentiment = False
+        for detection_id, detection in self.metadata["detections"].items():
+            if "a" in detection and "sen" in detection["a"]:
+                speech_sentiment = True
+                break
+        if not (speech_sentiment or sentiment_person_ids):
+            raise AppError("No sentiment data found on metadata")
+
+        sec_index = kwargs.get("start_second", 0)
+        for second_data in self._get_secdata_interval(**kwargs):
+            yield_bool = False
+            line_dict = OrderedDict([
+                ("second", sec_index),
+                ("timestamp", _seconds_to_timestamp_hhmmss(sec_index)),
+            ])
+            if speech_sentiment:
+                line_dict["speech valence"] = ""
+            line_dict.update([("face valence (%s)" % key, "") for key in sentiment_person_ids])
+            for occ in second_data:
+                if occ["d"] in sentiment_person_ids:
+                    if "a" in occ and "sen" in occ["a"] and "val" in occ["a"]["sen"]:
+                        line_dict["face valence (%s)" % occ["d"]] = occ["a"]["sen"]["val"]
+                        yield_bool = True
+                elif speech_sentiment and self.metadata["detections"][occ["d"]]["t"] == "audio.speech":
+                    detection = self.metadata["detections"][occ["d"]]
+                    if "a" in detection and "sen" in detection["a"] and "val" in detection["a"]["sen"]:
+                        line_dict["speech valence"] = detection["a"]["sen"]["val"]
+                        yield_bool = True
+
+            sec_index += 1
+            if yield_bool:
+                yield line_dict
+
+    def list_short(self, **kwargs):
+        """Special case of list-detections-by-second.
+
+        :param kwargs: Arguments used here:
+            - 'detection_label' (string).
+        :return: Yields only timestamp and labels.
+        :rtype: Generator[collections.OrderedDict]
+        """
+        for second in self._get_labels_by_second(**kwargs):
+            if len(second) > 1:
+                if kwargs.get("detection_label", None) and not _label_match(second[1:], kwargs.get("detection_label")):
+                    continue
+                yield OrderedDict([
+                    ("timestamp", _seconds_to_timestamp_hhmmss(second[0])),
+                    ("labels", second[1:]),
+                ])
+
+    def list_categories(self, **kwargs):
+        """List all categories found in metadata
+
+        :param kwargs:
+        :return: Yield each category and it's duration in seconds.
+        :rtype: Generator[collections.OrderedDict]
+        """
+        det_types = kwargs.get("detection_types").split(",") if kwargs.get("detection_types") is not None else None
+        # yield ["detection type", "category", "duration"]
+        counter = 0
+        for det_type, tag, duration in self.core_metadata.categories(
+                detection_types=det_types,
+                with_category=kwargs.get("category"),
+                start_second=kwargs["start_second"],
+                end_second=kwargs["end_second"],
+        ):
+            counter += 1
+            if kwargs.get("n_most_longest") is not None and counter > kwargs["n_most_longest"]:
+                break
+            # yield det_type, tag, "{:.3f}".format(float(data["duration"]))
+
+            yield OrderedDict([
+                ("detection type", det_type),
+                ("category tag", tag),
+                ("duration_s", "{:.3f}".format(duration)),
+            ])
+
+    def list_occurrences(self, **kwargs):
+        """Generator which yields information about each occurrence as OrderedDict.
+
+        :param kwargs:
+        :return: Dictionary containing relevant data.
+        :rtype: Generator[collections.OrderedDict]
+        """
+        extras = set()
+        if kwargs["detection_persons"]:
+            extras.add("similar_to")
+        if kwargs["extra_header"]:
+            extras |= set(kwargs["extra_header"])
+        for occ in self.core_metadata.occurrences(extras=extras,
+                                                  sort_by=kwargs["sort_by"],
+                                                  detection_types=kwargs["detection_types"],
+                                                  categories=kwargs["category"],
+                                                  start_second=kwargs["start_second"],
+                                                  end_second=kwargs["end_second"],
+                                                  ):
+            if not _conditions_match(self.metadata["detections"][occ["d"]], **kwargs):
+                continue
+            confidence = str(occ["c_max"]) if "c_max" in occ else ""
+            d = OrderedDict([
+                ("detection ID", occ["d"]),
+                ("detection type", occ["t"]),
+                ("label", self.core_metadata.label(detection_id=occ["d"])),
+                ("start second", occ["ss"]),
+                ("end second", occ["se"]),
+                ("shot index", occ["shs"]),
+                ("confidence", confidence),
+                ("category tags", " ".join(self.core_metadata.categories(detection_id=occ["d"]))),
+            ])
+            if "valence" in extras:
+                d["valence from -1.0 to 1.0"] = occ["val"] if occ["val"] is not None else "-"
+            if "similar_to" in extras:
+                if "name" in occ:
+                    d["similar to"] = occ["name"]
+                    d["face_recognition_confidence"] = occ["recog_c"]
+                else:
+                    d["similar_to"] = _person_name(
+                        self.metadata["detections"][occ["d"]], occ["d"])
+                    d["face_recognition_confidence"] = ""
+            yield d
 
     def list_subtitle(self, delta=0.5, min_sub_interval=2, **kwargs):
-        """Subtitle does not allow limiters at this time.
+        """Generate subtitles out of detected labels.
+        Subtitle does not allow limiters at this time.
 
         :param delta: The higher the delta, the later the subtitles show up compared to occurrence.
         :param min_sub_interval: Minimum time to show each subtitle.
@@ -132,7 +340,7 @@ class MetadataReader(object):
             - 'end_second' (int).
             - 'detection_types' (string).
         :return: Yields subtitles one field at time.
-        :rtype: Generator[list]
+        :rtype: Generator[collections.OrderedDict]
         """
         def min_max(list_par, n):
             """Returns min and max"""
@@ -145,10 +353,11 @@ class MetadataReader(object):
             return min_n, max_n
 
         space = 0.05
-        sub_data_gen = self.get_all_occs(
-            start=kwargs.get("start_second"),
-            stop=kwargs.get("end_second"),
-            det_type=kwargs.get("detection_types"),
+        sub_data_gen = self.core_metadata.occurrences(
+            start_second=kwargs.get("start_second"),
+            end_second=kwargs.get("end_second"),
+            detection_types=kwargs.get("detection_types"),
+            sort_by="start_second",
         )
         if kwargs.get("detection_types") == "audio.speech":
             # Assume that this can be outputted as it is.
@@ -158,11 +367,13 @@ class MetadataReader(object):
 
         last_end_time = -space
         subtitle_labels = []
-        for start, stop, label in sub_data_gen:
+        for occ in sub_data_gen:
+            start = occ["ss"]
+            stop = occ["se"]
+            label = self.core_metadata.label(detection_id=occ["d"])
             if [start, stop, label] not in subtitle_labels:
                 subtitle_labels.append([start, stop, label])
             s_min, s_max = min_max(subtitle_labels, 0)
-
             while last_end_time + 4 * min_sub_interval < s_max:
                 # Start time
                 start_time = max(last_end_time + space, s_min + delta)
@@ -184,7 +395,13 @@ class MetadataReader(object):
                     end_time_3 = float('inf')
                 end_time = max(min(end_time_2, end_time_3), end_time_1)
 
-                yield [start_time, end_time] + line_labels
+                # YIELD (Print)
+                yield OrderedDict([
+                    ("start_time", start_time),
+                    ("end_time", end_time),
+                    ("labels", line_labels),
+                ])
+                # self.writer.writerow([start_time, end_time] + line_labels)
 
                 # Remove old labels:
                 last_end_time = end_time
@@ -215,7 +432,12 @@ class MetadataReader(object):
                 end_time_3 = float('inf')
             end_time = max(min(end_time_2, end_time_3), end_time_1)
 
-            yield [start_time, end_time] + line_labels
+            # (Print) YIELD
+            yield OrderedDict([
+                ("start_time", start_time),
+                ("end_time", end_time),
+                ("labels", line_labels),
+            ])
 
             # Remove old labels:
             last_end_time = end_time
@@ -224,11 +446,12 @@ class MetadataReader(object):
                 break
             s_min, s_max = min_max(subtitle_labels, 0)
 
-    def list_summary(self, **kwargs):
+    def list_summary(self, detection_type=None, **kwargs):  # TODO: perhaps redesign this.
         """Method to gather list containing summary.
 
+        :param detection_type: Chosen detection type for summary. Default: human.face + visual.context.
+        :type detection_type: str or None
         :param kwargs: Arguments used here:
-            - 'detection_type' (string).
             - 'addition_method' (string). Choose 'union' or 'normal', default is 'union'
             - 'min_confidence' (float).
             - 'skip_unknown_faces' (bool).
@@ -240,9 +463,8 @@ class MetadataReader(object):
                     (confidence,)
                     of_video_length
                   ]}
-        :rtype: Generator[dict[str, list]]
+        :rtype: Generator[dict[str, collections.OrderedDict]]
         """
-        detection_type = kwargs.pop("detection_type", None)
         if detection_type is None:
             for partial_dict in self.list_summary(detection_type="human.face", **kwargs):
                 yield partial_dict
@@ -261,104 +483,105 @@ class MetadataReader(object):
 
         add_type = kwargs.get("addition_method", "union")
         summ_dict = {detection_type: {}}
-
+        summ_list = {detection_type: []}
         if detection_type == "human.face":
             if "human.face" in self.metadata["detection_groupings"]["by_detection_type"]:
                 for detection_id in self.metadata["detection_groupings"]["by_detection_type"][detection_type]:
+
                     detection = self.metadata["detections"][detection_id]
+
                     if "similar_to" in detection["a"]:
+                        # Take first cell, as it should be most accurate:
+                        name = detection["a"]["similar_to"][0]["name"]
+                        confidence = detection["a"]["similar_to"][0]["c"]
 
-                        screentime = LengthSum(add_type)
-                        for occ in detection["occs"]:
-                            # human.face doesn't have occ confidence
-                            screentime.add(occ["ss"], occ["se"])
-
-                        # Take first cell, as it's most accurate:
-                        cell = detection["a"]["similar_to"][0]
-                        if kwargs.get("min_confidence") and cell["c"] < kwargs.get("min_confidence"):
+                        if kwargs.get("min_confidence") and \
+                                detection["a"]["similar_to"][0]["c"] < kwargs.get("min_confidence"):
                             continue
-                        summ_dict[detection_type]["{}".format(detection_id)] = [
-                            cell['name'],                   # 0 : name_or_label
-                            screentime,                     # 1 : screentime
-                            cell['c'],                      # 2 : confidence
-                            float(screentime)/video_length  # 3 : of video length
-                        ]
                     else:
                         # UNKNOWN PERSON
                         if kwargs.get("skip_unknown_faces", None):
                             continue
-                        screentime = LengthSum(add_type)
-                        for occ in detection["occs"]:
-                            screentime.add(occ["ss"], occ["se"])
-                        summ_dict[detection_type]["{}".format(detection_id)] = [
-                            "unknown {} (det id: {})".format(detection["a"]["gender"]["value"], detection_id),  # 0 : name_or_label
-                            float(screentime),                                       # 1 : screentime
-                            '-',                                                     # 2 : confidence
-                            float(screentime) / video_length                         # 3 : of video length
-                        ]
+                        name = _person_name(detection, detection_id)
+                        confidence = "-"
+
+                    screentime = LengthSum(add_type)
+                    for occ in detection["occs"]:
+                        # human.face doesn't have occ confidence
+                        screentime.add(occ["ss"], occ["se"])
+                    summ_dict[detection_type][detection_id] = OrderedDict([
+                        ("name", name),
+                        ("face_recognition_confidence", confidence),
+                        ("screentime_s", screentime),
+                        # ("of_video_lenght", float(screentime)/video_length),
+                    ])
+                    if kwargs.get("emotion"):
+                        emotions = self.core_metadata.emotion(detection_id)
+                        summ_dict[detection_type][detection_id].update(sorted(emotions.items()))
 
                 #
                 # Combine identities:
                 if not kwargs.get("separate_face_identities", False):
-                    new_dict = {detection_type: dict()}
-                    face_dict = dict()
-                    for id, item in summ_dict[detection_type].iteritems():
-                        if item[0].startswith("unknown"):
-                            new_dict[detection_type][id] = item
-                            continue
-                        if item[0] in face_dict:
-                            face_dict[item[0]][1][1].add(item[1])  # Screentime
-                            face_dict[item[0]][1][2] = min(face_dict[item[0]][1][2], item[2])  # Confidence
-                            face_dict[item[0]][1][3] = face_dict[item[0]][1][1] / video_length  # of vid. len.
+                    face_dict = {}
+                    for id, item in summ_dict[detection_type].items():
+                        if item["name"] in face_dict:
+                            # Add screentime and emotions and use smaller confidence.
+                            face_dict[item["name"]]["screentime_s"].add(item["screentime_s"])
+                            face_dict[item["name"]]["face_recognition_confidence"] = min(
+                                    face_dict[item["name"]]["face_recognition_confidence"],
+                                    item["face_recognition_confidence"])
+                            if kwargs.get("emotion"):
+                                for emotion in self.core_metadata.available_emotions:
+                                    face_dict[item["name"]][emotion] += item[emotion]
                         else:
-                            face_dict[item[0]] = id, item
+                            face_dict[item["name"]] = item
 
-                    for id, face in face_dict.itervalues():
-                        new_dict[detection_type][id] = face
-                    summ_dict = new_dict
+                    summ_list[detection_type] = face_dict.values()
 
-        else:
+        else:  # detection_type != "human.face"
             if detection_type in self.metadata["detection_groupings"]["by_detection_type"]:
                 for detection_id in self.metadata["detection_groupings"]["by_detection_type"][detection_type]:
                     detection = self.metadata["detections"][detection_id]
-                    # TESTING FOR CONFIDENCE
+
+                    # If categor(y|ies) given, allow only those
+                    if kwargs.get("category"):
+                        if "categ" in detection and "tags" in detection["categ"] and \
+                                set(detection["categ"]["tags"]) & set(kwargs.get("category", [])):
+                            # Detection has correct category!
+                            pass
+                        else:
+                            # Either detection doesn't have categories at all, or just
+                            # missing correct one: skip.
+                            continue
+                    # Testing for detection confidence
                     if kwargs.get("min_confidence") and not _min_confidence_match(detection, kwargs.get("min_confidence")):
                         continue
                     screentime = LengthSum(add_type)
                     for occ in detection["occs"]:
-                        # TESTING (again) FOR CONFIDENCE
+                        # Testing for occurrence confidence
                         if kwargs.get("min_confidence") and occ["c_max"] < kwargs.get("min_confidence"):
                             continue
                         screentime.add(occ["ss"], occ["se"])
 
-                    summ_dict[detection_type][detection_id] = [
-                        detection["label"],                 # 0 : name_or_label
-                        screentime,                         # 1 : screentime
-                        float(screentime) / video_length    # 2 : of video length
-                    ]
+                    summ_dict[detection_type][detection_id] = OrderedDict([
+                        ("label", detection["label"]),
+                        ("screentime_s", screentime),
+                    ])
+                summ_list[detection_type] = summ_dict[detection_type].values()
 
         # Sort and limit by n-most-prominent-detections-per-type
-        count = 0
         n_first = kwargs.get("n_most_prominent_detections_per_type", None)
-        if n_first is None:
-            n_first = float('inf')
-        summ_list = {detection_type: list()}
-        for item in sorted(summ_dict[detection_type].itervalues(),
-                           key=lambda v: float(v[1]),
-                           reverse=True):
-            if detection_type == "human.face":
-                item[1] = "{:.3f}".format(float(item[1]))  # remove float calculation errors
-            else:
-                # Labels etc. have one second resolution
-                item[1] = "{:.1f}".format(float(item[1]))  # remove float calculation errors
-            if count >= n_first:
-                break
-            count += 1
-            summ_list[detection_type].append(item)
-        yield dict(summary=summ_list)
+
+        yield {
+            "summary": {
+                detection_type: sorted(summ_list[detection_type],
+                                       key=lambda v: float(v["screentime_s"]),
+                                       reverse=True)[:n_first]
+            }
+        }
 
     def metadata_info(self):
-        """Outputs info about given metadata-file
+        """Prints info about given metadata-file into sys.stdout
 
         Currently outputs:
             - metadata format
@@ -376,29 +599,33 @@ class MetadataReader(object):
         media_info = self.metadata["media_info"]
         job_info = self.metadata["job_info"]["request"]["media"]
 
-        print_list = list()
-        print_list.append(u"Metadata format:  {}".format(versions["metadata_format"]))
-        print_list.append(u"Backend version:  {}".format(versions["backend"]))
-        print_list.append(u"")
+        print_list = [
+            "Metadata format:  {}".format(versions["metadata_format"]),
+            "Backend version:  {}".format(versions["backend"]),
+            "",
 
-        # MEDIA_INFO
-
-        print_list.append(u"Media title:      {}".format(media_info["from_customer"]["title"]))
-        print_list.append(u"Duration:         {}".format(_seconds_to_timestamp_hhmmss(media_info["technical"]["duration_s"])))
-        if job_info["description"] is None:
-            description = u"-"  # Better than just u"None"
-        else:
-            description = job_info["description"]
-        print_list.append(u"Description:      {}".format(description))
-        print_list.append(u"")
+            # MEDIA_INFO
+            "Media title:      {}".format(media_info["from_customer"]["title"]),
+            "Duration:         {}".format(_seconds_to_timestamp_hhmmss(media_info["technical"]["duration_s"])),
+            "Description:      {}".format("" if job_info["description"] is None else job_info["description"]),
+            "",
+        ]
 
         if job_info["video"]["url"] is not None:
-            print_list.append(u"Video URL:        {}".format(job_info["video"]["url"]))
+            print_list.append("Video URL:        {}".format(job_info["video"]["url"]))
         if job_info["transcript"]["url"] is not None:
-            print_list.append(u"Video URL:        {}".format(job_info["transcript"]["url"]))
+            print_list.append("Transcript URL:        {}".format(job_info["transcript"]["url"]))
 
         for item in print_list:
-            print item
+            print(item)
+
+    @property
+    def video_title(self):
+        """Media info, from customer, title
+
+        :return: Video title given by customer.
+        """
+        return self.core_metadata.media_title
 
     def _get_all_detections(self, detection_types=None, n_most_prominent_detections_per_type=float("inf"), **kwargs):
         """List all detections unless type or count is limited
@@ -441,7 +668,7 @@ class MetadataReader(object):
         :return: List of second data.
         :rtype: list[list]
         """
-        if kwargs.get("end_second", None) is None:
+        if kwargs.get("end_second") is None:
             secdata_interval = self.metadata["detection_groupings"]["by_second"][kwargs.get("start_second", 0):]
         else:
             secdata_interval = self.metadata["detection_groupings"]["by_second"][
@@ -458,10 +685,11 @@ class MetadataReader(object):
         :return:
         :rtype: Generator[list]
         """
-        secdata_interval = self._get_secdata_interval(**kwargs)
-        sec_index = kwargs.get("start_second", 0) - 1
-        for secdata in secdata_interval:
-            sec_index += 1
+        secdata_interval = self.core_metadata.second_data(
+            start_second=kwargs["start_second"],
+            end_second=kwargs["end_second"],
+        )
+        for sec_index, secdata in secdata_interval:
             for detdata in secdata:
                 detection_id = detdata["d"]
                 detection = self.metadata["detections"][detection_id]
@@ -469,47 +697,88 @@ class MetadataReader(object):
                     continue
                 yield sec_index, detdata
 
-    def get_all_occs(self, start=0, stop=None, det_type=None):
-        """Generator which yields each occ ordered by starting time.
+    def _get_labels_by_second(self, **kwargs):
+        """Output just second with labels
 
-        :param start: Define starting time
-        :type start: int | float
-        :param stop: Stop when this time is reached.
-        :type stop: int | float | None
-        :param det_type: Choose specific detection type with this parameter.
-        :type det_type: str |None
-        :return: (start_time, stop_time, label)
-        :rtype: Generator[tuple]"""
-        if stop is None:
-            # Make sure that stop is bigger than index
-            stop = float('inf')
-        labels = list()
-        for id, detection in self.metadata["detections"].iteritems():
-            if det_type and detection["t"] not in det_type:
-                continue
-            if "occs" not in detection:
-                continue
+        Format: [second, label,label,...]
+        """
+        index = kwargs.get("start_second", 0)
+        for second in self._get_secdata_interval(**kwargs):
+            labels = [index]
+            for occ in second:
+                if kwargs.get("detection_type") and\
+                        self.metadata["detections"][occ["d"]]["t"] not in kwargs.get("detection_type"):
+                    continue
+                if kwargs.get("min_confidence") and occ.get("c") and kwargs["min_confidence"] > occ["c"]:
+                    # Test for confidence on that second.
+                    continue
+                if not _min_confidence_match(self.metadata["detections"][occ["d"]], kwargs.get("min_confidence")):
+                    continue
+                label = self.metadata["detections"][occ["d"]]["label"]
+                labels.append(label)
+
+            yield labels
+            index += 1
+
+    def get_subtitle_data(self, start=0, stop=None, det_type=None):
+        """Yields data needed for label-subtitle generation
+
+        :param start: The starting second.
+        :type start: int or float
+        :param stop: The final second (default: till end of video)
+        :type stop: int or float or None
+        :param list det_type: List of detection types to whitelist.
+        :return: Yields [start, stop, label/name].
+        :rtype: Generator[list]
+        """
+        for secdata in self.get_all_occs_by_second_data(start, stop, det_type):
+            detection = self.metadata["detections"][secdata["d"]]
+            # Get start and stop times for detection:
+            for occ in detection["occs"]:  # Find the occ
+                if occ["id"] == secdata["o"][0]:
+                    start = occ["ss"]
+                    stop = occ["se"]
             # Generate label:
-            if "a" in detection and "similar_to" in detection["a"]:
-                label = detection["a"]["similar_to"][0]["name"]
-            elif "a" in detection and "gender" in detection["a"]:
-                label = "unknown {} ({})".format(detection["a"]["gender"]["value"], id)
+            if "a" in detection and detection["t"] == "human.face":
+                # human.face (most likely?)
+                label = _person_name(detection)
+
             elif "label" in detection:
                 label = detection["label"]
             else:
                 raise RuntimeError("No 'a' or 'label' in detection")
-            for occ in detection["occs"]:
-                labels.append((occ["ss"], occ["se"], label))
-        for item in sorted(labels, key=lambda x: x[0]):
-            if item[0]<start:
-                continue
-            if item[0]>stop:
-                break  # items are sorted by start_time so it's safe to break here.
-            yield item
+            yield [start, stop, label]
+
+    def get_all_occs_by_second_data(self, start=0, stop=None, det_type=None):
+        """Yields every second of metadata unless limited.
+
+        :param start: The starting second.
+        :type start: int or float
+        :param stop: The final second (default: till end of video)
+        :type stop: int or float or None
+        :param list det_type: List of detection types to whitelist.
+        :return: Yields data from metadata["detection_groupings"]["by_second"] structure.
+        :rtype: Generator[dict]
+        """
+        if stop is None:
+            # Make sure that stop is bigger than index
+            stop = float('inf')
+        index = start
+        for second in self.metadata["detection_groupings"]["by_second"][start:]:
+            if index > stop:
+                break
+            for secdata in second:
+                if det_type and self.metadata["detections"][secdata["d"]]["t"] not in det_type:
+                    continue
+                yield secdata
 
 
 def _detection_type_specific_information(detection):
-    """Returns information specific to detection type"""
+    """Returns information specific to detection type
+
+    :param dict detection: A detection object from metadata["detections"].
+    :return: Potentially useful information specific to detection type.
+    """
     info = ""
     if detection["t"] == "human.face":
         attrs = detection["a"]
@@ -517,10 +786,12 @@ def _detection_type_specific_information(detection):
             attrs["gender"]["c"]) + ". "
         if "similar_to" in attrs:
             for similar in attrs["similar_to"]:
+                # info += "Similar to person: {} with confidence: {}.".format(similar["name"], str(similar["c"]))
                 info += "Similar to person: " + similar["name"] + " with confidence: " + str(
                     similar["c"]) + "."
     elif detection["t"].startswith("topic.iab."):
         info += "IAB ID: " + detection["ext_refs"]["iab"]["id"] + ". "
+        # info += "IAB hierarchical label structure: " + str(detection["ext_refs"]["iab"]["labels_hierarchy"]) + ". "
     return info
 
 
@@ -555,6 +826,11 @@ def _conditions_match(detection, count=None, **kwargs):
     if kwargs.get("min_confidence") is not None and not \
             _min_confidence_match(detection, kwargs["min_confidence"]):
         return False
+    # --category x y z
+    if kwargs.get("category") is not None:
+        if "categ" not in detection or "tags" not in detection["categ"] or \
+                not set(detection["categ"]["tags"]) & set(kwargs["category"]):
+            return False
     return True
 
 
@@ -566,6 +842,8 @@ def _min_confidence_match(detection, min_confidence):
 
     Returns `True` if confidence is high enough.
     """
+    if min_confidence is None:
+        return True
     if "a" in detection and "similar_to" in detection["a"]:
         for similar in detection["a"]["similar_to"]:
             if similar["c"] >= min_confidence:
@@ -590,41 +868,30 @@ def _min_confidence_match(detection, min_confidence):
     return False
 
 
-def _types_match(det_type, type_arg):
-    """
-    Method tests for asterix wildcard '*'.
-    Supported positions for wildcards are following:
-       "*something"
-       "something*"
-       "*something*"
-    Method isn't quite robust yet.
-    """
+def _types_match(det_type, type_list):
+    """If types match, return True, else False
 
-    arg_list = [x.strip() for x in type_arg.split(',')]
-    if True in [_wildcard_search(key_arg, det_type) for key_arg in arg_list]:
+    :param det_type:
+    :type det_type: str
+    :param type_list:
+    :type type_list: list
+    :return:
+    :rtype: bool
+    """
+    if det_type in type_list:
         return True
-    return False
+    else:
+        return False
 
 
 def _label_match(label, arg):
-    """Checks if arg is in labels list.
+    """Used to check if arg is in labels list.
 
-    :param label_list: List of labels
     :param arg: User given argument
     :return: Boolean value True if matched, False otherwise
     """
 
     return arg == label
-
-    # Seperate by comma and strip leading and trailing whitespace:
-    # labelList = [x.strip() for x in labels.split(',')]
-    # arg_list = [x.strip() for x in args.split(',')]
-    # if True in [_wildcard_search(keyarg, label) for keyarg in arg_list for label in label_list]:
-    #    return True
-    # return False
-
-    # One-line version:
-    # return True in [_wildcard_search(k,l) for k in [x.strip() for x in args.split(',')] for l in [x.strip() for x in labels.split(',')]]
 
 
 def _person_match(detection, args):
@@ -646,6 +913,21 @@ def _person_match(detection, args):
     nameList = [x["name"] for x in detection["a"]["similar_to"]]
     argList = [x.strip() for x in args.split(',')]
     if True in [_wildcard_search(keyarg, name) for keyarg in argList for name in nameList]:
+        return True
+    return False
+
+
+def _old_concept_id_match(detection, searchArg):
+    """Accepts both Valossa Concept ID and GKG Concept ID"""
+
+    # b = ("cid" in detection) or ("ext_refs" in detection and "gkg" in detection["ext_refs"])
+    ids = []
+    if "cid" in detection:
+        ids.append(detection["cid"])
+    if "ext_refs" in detection and "gkg" in detection["ext_refs"]:
+        ids.append(detection["ext_refs"]["gkg"]["id"])
+
+    if searchArg in ids:
         return True
     return False
 
@@ -689,6 +971,32 @@ def _wildcard_search(keyword, det_cell):
     return True
 
 
+def _person_name(detection, detection_id=None, confidence=False):
+    if detection["t"] != "human.face":  # Has to be human.face
+        return ""
+    if "similar_to" in detection["a"]:
+        if confidence:
+            return detection["a"]["similar_to"][0]["c"], detection["a"]["similar_to"][0]["name"]
+        else:
+            return detection["a"]["similar_to"][0]["name"]
+    elif "gender" in detection["a"]:
+        label = "unknown {}".format(detection["a"]["gender"]["value"])
+    else:
+        label = "unknown person"
+    if detection_id is not None:
+        label += " (det ID: {})".format(detection_id)
+    if confidence:
+        return None, label
+    return label
+
+
+def _person_gender(detection):
+    if "a" in detection and "gender" in detection["a"]:
+        return detection["a"]["gender"]["value"]
+    else:
+        return ""
+
+
 def _seconds_to_timestamp_hhmmss(seconds_from_beginning):
     """Generates timestamp from inputted seconds
 
@@ -700,73 +1008,3 @@ def _seconds_to_timestamp_hhmmss(seconds_from_beginning):
     minutes = s // 60
     seconds = s - (minutes * 60)
     return '%02d:%02d:%02d' % (hours, minutes, seconds)
-
-
-class LengthSum(object):
-    """Class to allow changing addition type.
-
-    Union type addition simply extends time range when adding
-
-    Normal type addition just adds end-start each time
-    """
-    def __init__(self, sum_type="normal"):
-        self.compress_flag = False
-        if sum_type == "union":
-            self.add = self.add_union
-            self.sum_type = "union"
-            self.intervals = []
-        elif sum_type == "normal":
-            self.add = self.add_normal
-            self.sum_type = "normal"
-            self.sum = 0.0
-        else:
-            raise TypeError("sum_type must be either union or normal")
-
-    def __str__(self):
-        return str(self.__float__())
-
-    def __repr__(self):
-        return repr(self.__float__())
-
-    def __float__(self):
-        if self.compress_flag:
-            self.intervals = self.compress(self.intervals)
-        if self.sum_type == "union":
-            r_sum = 0.0
-            for interval in self.intervals:
-                r_sum += interval[1] - interval[0]
-            return r_sum
-        return self.sum
-
-    def __div__(self, other):
-        return self.__float__() / other
-
-    def add_union(self, ss, se=None):
-        # If trying to add self, do nothing:
-        if ss is self:
-            pass
-        elif se is None and type(ss) == LengthSum:
-            for interval in ss.intervals:
-                self.intervals.append(interval)
-        else:
-            self.intervals.append((ss, se))
-        self.compress_flag = True
-
-    def add_normal(self, ss, se=None):
-        if se is None and type(ss) == LengthSum:
-            self.sum += ss.sum
-        else:
-            self.sum += se - ss
-
-    @staticmethod
-    def compress(source_list):
-        if not source_list:
-            return source_list
-        source_list.sort(key=lambda lis: lis[0])
-        return_list = [source_list[0]]
-        for cell in source_list[1:]:
-            if cell[0] > return_list[-1][1]:
-                return_list.append(cell)
-            elif return_list[-1][1] <= cell[1]:
-                return_list[-1] = (return_list[-1][0], cell[1])
-        return return_list

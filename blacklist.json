@@ -1,0 +1,13 @@
+{
+	"_concept_tags": "Add detection labels you wish to be blacklisted here",
+	"concept_tags": [],
+	"_category_tags_strong_blacklist": "This will blacklist any concept that has this category tag.",
+	"category_tags_strong_blacklist": [
+		"lights_effects",
+		"style"
+	],
+	"_category_tags_weak_blacklist": "This will not blacklist the concepts that have a category tag that isn't blacklisted.",
+	"category_tags_weak_blacklist": [
+		"time"
+	]
+}
