@@ -167,7 +167,7 @@ class AddArguments:
         )
         parser.add_argument(
             "--extra-header", nargs="+",
-            choices=["similar_to", "gender"],
+            choices=["similar_to", "gender", "text"],
             help="Use this option to select extra headers for output."
         )
 
@@ -250,7 +250,7 @@ class AddArguments:
         )
         parser.add_argument(
             "--extra-header", nargs="+",
-            choices=["similar_to", "gender", "valence"],
+            choices=["similar_to", "gender", "valence", "text"],
             help="Use this option to select extra headers for output."
         )
 
@@ -378,7 +378,7 @@ class AddArguments:
         )
         parser.add_argument(
             "--extra-header", nargs="+",
-            choices=["valence", "similar_to"],
+            choices=["valence", "similar_to", "text"],
             help="Use this option to select extra headers for output."
         )
 

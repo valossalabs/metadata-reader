@@ -66,6 +66,9 @@ class MetadataPrinter(object):
         if type(first_line) is OrderedDict:
             self.print_header(first_line)
             self.print_line(first_line)
+        elif "summary" in first_line: # summary
+            self.print_header(first_line)
+            self.print_line(first_line)
         else:
             raise RuntimeError("Must be OrderedDict!")
 

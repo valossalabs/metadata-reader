@@ -83,6 +83,8 @@ class MetadataReader(object):
                 d["similar to"] = _person_name(detection=detection) if detection["t"] == "human.face" else ""
             if "gender" in extras:
                 d["gender"] = _person_gender(detection=detection) if detection["t"] == "human.face" else ""
+            if "text" in extras:
+                d["text"] = _textregion_text(detection=detection) if "visual.text_region" in detection["t"] else ""
             yield d
 
     def list_detections_by_second(self, **kwargs):
@@ -178,6 +180,8 @@ class MetadataReader(object):
                     d["similar to"] = _person_name(detection=detection) if detection["t"] == "human.face" else ""
                 if "gender" in extras:
                     d["gender"] = _person_gender(detection=detection) if detection["t"] == "human.face" else ""
+                if "text" in extras:
+                    d["text"] = _textregion_text(detection=detection) if "visual.text_region" in detection["t"] else ""
                 yield d
 
     def list_sentiment(self, **kwargs):
@@ -327,6 +331,9 @@ class MetadataReader(object):
                     d["similar_to"] = _person_name(
                         self.metadata["detections"][occ["d"]], occ["d"])
                     d["face_recognition_confidence"] = ""
+            if "text" in extras:
+                detection = self.metadata["detections"][occ["d"]]
+                d["text"] = _textregion_text(detection=detection) if "visual.text_region" in detection["t"] else ""
             yield d
 
     def list_subtitle(self, delta=0.5, min_sub_interval=2, **kwargs):
@@ -494,7 +501,6 @@ class MetadataReader(object):
                         # Take first cell, as it should be most accurate:
                         name = detection["a"]["similar_to"][0]["name"]
                         confidence = detection["a"]["similar_to"][0]["c"]
-
                         if kwargs.get("min_confidence") and \
                                 detection["a"]["similar_to"][0]["c"] < kwargs.get("min_confidence"):
                             continue
@@ -537,7 +543,6 @@ class MetadataReader(object):
                             face_dict[item["name"]] = item
 
                     summ_list[detection_type] = face_dict.values()
-
         else:  # detection_type != "human.face"
             if detection_type in self.metadata["detection_groupings"]["by_detection_type"]:
                 for detection_id in self.metadata["detection_groupings"]["by_detection_type"][detection_type]:
@@ -571,7 +576,6 @@ class MetadataReader(object):
 
         # Sort and limit by n-most-prominent-detections-per-type
         n_first = kwargs.get("n_most_prominent_detections_per_type", None)
-
         yield {
             "summary": {
                 detection_type: sorted(summ_list[detection_type],
@@ -996,6 +1000,11 @@ def _person_gender(detection):
     else:
         return ""
 
+def _textregion_text(detection):
+    if "a" in detection and "text" in detection["a"]:
+        return detection["a"]["text"]["as_one_string"]
+    else:
+        return ""
 
 def _seconds_to_timestamp_hhmmss(seconds_from_beginning):
     """Generates timestamp from inputted seconds
